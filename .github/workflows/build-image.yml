@@ -1,8 +1,5 @@
 name: Build and push LichtFeld Studio image
 
-# Manual trigger by default (this is a ~60-90 min compile - not something
-# that should fire on every push by accident). Also runs automatically if
-# you edit the Dockerfile/scripts themselves.
 on:
   workflow_dispatch:
     inputs:
@@ -21,12 +18,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # GitHub's free runners are 2-core - compiling LichtFeld's CUDA/vcpkg
-    # dependency tree here will likely take longer wall-clock than it would
-    # on a beefier RunPod pod. That's the trade you're making for it being
-    # free instead of costing paid GPU-hours; layer caching below (cache-from
-    # /cache-to: type=gha) means only the FIRST build pays this in full -
-    # later rebuilds (e.g. bumping lfs_ref) reuse unchanged layers.
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +42,14 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN as env vars so the
+      # Docker build below can hand them to vcpkg. Without this, vcpkg has
+      # no persistent cache and a mid-install failure (like the automake
+      # 502 we just hit) means the NEXT run rebuilds every already-succeeded
+      # package from source too - this is what fixes that.
+      - name: Export GitHub Actions cache variables
+        uses: crazy-max/ghaction-github-runtime@v3
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -58,6 +57,9 @@ jobs:
           push: true
           build-args: |
             LFS_REF=${{ github.event.inputs.lfs_ref || 'master' }}
+          secrets: |
+            "actions_cache_url=${{ env.ACTIONS_CACHE_URL }}"
+            "actions_runtime_token=${{ env.ACTIONS_RUNTIME_TOKEN }}"
           tags: |
             dakord/lichtfeld-studio:latest
             dakord/lichtfeld-studio:${{ github.run_number }}
