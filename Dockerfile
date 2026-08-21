@@ -78,7 +78,6 @@ RUN --mount=type=secret,id=actions_cache_url \
     export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url 2>/dev/null || true)" \
     && export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token 2>/dev/null || true)" \
     && export VCPKG_BINARY_SOURCES="clear;x-gha,readwrite" \
-    && export X_VCPKG_ASSET_SOURCES="x-gha,readwrite" \
     && cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
