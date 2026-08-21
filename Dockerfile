@@ -66,17 +66,19 @@ RUN git clone --recursive https://github.com/MrNeRF/LichtFeld-Studio.git . \
     && git checkout ${LFS_REF} \
     && git submodule update --init --recursive
 
-# Build flags:
-#   BUILD_CUDA_PTX_ONLY + BUILD_PORTABLE: JIT PTX at first run instead of
-#     baking one fixed SM target, so this one image works whatever GPU
-#     model RunPod happens to hand you (chosen over pinning to a single
-#     GPU's compute capability).
-#   BUILD_CUDA_MIN_SM=75: matches LichtFeld's own default minimum (SM 7.5),
-#     set explicitly here for clarity rather than relying on the default.
-#   CUDA_DEVICE_DEBUG=OFF: CMakeLists.txt defaults this ON, which ships a
-#     -G debug-instrumented (much slower) CUDA binary - turned off since
-#     this image is for actual training runs, not debugging LichtFeld itself.
-RUN cmake -B build -G Ninja \
+# vcpkg's own binary cache, backed by the GitHub Actions cache service
+# (secrets mounted below, exported by the workflow's "Export GitHub
+# Actions cache variables" step). This caches per-PACKAGE build output,
+# independent of Docker's own layer cache - so if a transient failure
+# (like a flaky mirror mid-download) kills the install after 50 of 86
+# packages already built successfully, a retry restores those 50 from
+# cache instead of recompiling them, and only rebuilds what's left.
+RUN --mount=type=secret,id=actions_cache_url \
+    --mount=type=secret,id=actions_runtime_token \
+    export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url 2>/dev/null || true)" \
+    && export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token 2>/dev/null || true)" \
+    && export VCPKG_BINARY_SOURCES="clear;x-gha,readwrite" \
+    && cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
         -DBUILD_CUDA_PTX_ONLY=ON \
