@@ -34,11 +34,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The X11/GL/GTK -dev packages are needed at BUILD/link time even for a
 # headless CLI run, since the GUI code paths are compiled into the same
 # binary regardless of the --headless runtime flag.
+# nasm/autoconf/autoconf-archive/automake/libtool: needed by vcpkg ports
+# further down the dependency tree (x264's asm routines need nasm on PATH
+# directly - vcpkg_find_acquire_program(NASM) doesn't build its own; other
+# autotools-based ports expect these on the system rather than bundling
+# their own, unlike vcpkg-make which does fetch its own automake).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates gnupg wget curl git zip unzip tar pkg-config \
         build-essential \
         gcc-14 g++-14 gfortran-14 \
         ninja-build python3 python3-pip \
+        nasm autoconf autoconf-archive automake libtool \
         libglu1-mesa-dev libgtk-3-dev xorg-dev libgl1-mesa-dev libegl1-mesa-dev \
         libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
