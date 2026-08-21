@@ -85,7 +85,8 @@ RUN cmake -B build -G Ninja \
         -DCUDA_DEVICE_DEBUG=OFF \
         -DBUILD_TESTS=OFF \
     && cmake --build build -- -j$(nproc) \
-    && cmake --install build --prefix /opt/lichtfeld
+    && cmake --install build --prefix /opt/lichtfeld \
+    && rm -rf ${VCPKG_ROOT}/buildtrees ${VCPKG_ROOT}/downloads build
 
 # Discover the actual runtime .so closure via ldd instead of guessing which
 # apt runtime packages the binary needs - copies every non-system shared
