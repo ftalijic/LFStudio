@@ -1,5 +1,8 @@
 name: Build and push LichtFeld Studio image
 
+# Manual trigger by default (this is a ~60-90 min compile - not something
+# that should fire on every push by accident). Also runs automatically if
+# you edit the Dockerfile/scripts themselves.
 on:
   workflow_dispatch:
     inputs:
@@ -18,7 +21,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    # This repo is public, so ubuntu-latest here is the 4-core/16GB standard
+    # runner (private repos on the free plan only get 2-core/8GB) - compiling
+    # LichtFeld's CUDA/vcpkg dependency tree will still likely take longer
+    # wall-clock than it would on a beefier RunPod pod, but public-repo
+    # runner minutes are free either way. Two layers of caching apply after
+    # the first successful build: Docker's own layer cache (cache-from/
+    # cache-to: type=gha below) skips unchanged RUN instructions entirely,
+    # and the vcpkg binary/download cache (buildkit-cache-dance step below)
+    # means even the one RUN instruction that changes on every lfs_ref bump
+    # doesn't have to rebuild all ~89 vcpkg packages from scratch.
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -34,21 +47,43 @@ jobs:
           swap-storage: true
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
+
+      # Persists the Dockerfile's `--mount=type=cache` vcpkg binary/download
+      # cache directories across separate workflow runs. Plain BuildKit cache
+      # mounts do NOT survive between GitHub Actions runs on their own - each
+      # job gets a fresh builder/VM - this action bridges that gap using
+      # actions/cache to save/restore the mount contents around the build.
+      # (See https://github.com/docker/build-push-action/issues/1011 - the
+      # gha layer cache below does not cover this; and
+      # https://github.com/reproducible-containers/buildkit-cache-dance,
+      # the standard fix for it.)
+      - name: Restore vcpkg build cache
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: cache-mount
+          key: vcpkg-cache-${{ hashFiles('Dockerfile') }}
+          restore-keys: |
+            vcpkg-cache-
+
+      - name: Inject vcpkg cache into builder
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "vcpkg-binary": "/vcpkg-binary-cache",
+              "vcpkg-downloads": "/vcpkg-downloads-cache"
+            }
+          skip-extraction: ${{ steps.vcpkg-cache.outputs.cache-hit }}
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN as env vars so the
-      # Docker build below can hand them to vcpkg. Without this, vcpkg has
-      # no persistent cache and a mid-install failure (like the automake
-      # 502 we just hit) means the NEXT run rebuilds every already-succeeded
-      # package from source too - this is what fixes that.
-      - name: Export GitHub Actions cache variables
-        uses: crazy-max/ghaction-github-runtime@v3
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -57,9 +92,6 @@ jobs:
           push: true
           build-args: |
             LFS_REF=${{ github.event.inputs.lfs_ref || 'master' }}
-          secrets: |
-            "actions_cache_url=${{ env.ACTIONS_CACHE_URL }}"
-            "actions_runtime_token=${{ env.ACTIONS_RUNTIME_TOKEN }}"
           tags: |
             dakord/lichtfeld-studio:latest
             dakord/lichtfeld-studio:${{ github.run_number }}
