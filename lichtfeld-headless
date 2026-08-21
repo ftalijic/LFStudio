@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Convenience wrapper: run once you've SSH'd into the pod, exactly like the
+# existing oblaQ workflow (ns-train etc. run manually over SSH, not as a
+# run-to-completion container command). Strongly recommended to run this
+# inside tmux (`tmux new -s train`, then `lichtfeld-headless ...`, then
+# Ctrl-b d to detach) - training at -i 30000 can take hours, and an SSH
+# drop otherwise kills it.
+#
+# Usage, e.g.:
+#   lichtfeld-headless --headless --train -d /workspace/data -o /workspace/output -i 30000 -r 1
+#
+# Wraps the binary in xvfb-run automatically whenever no DISPLAY is set, as
+# a safety net in case --headless still wants a GL context internally
+# (LichtFeld's docs don't confirm either way, so this costs nothing to have
+# and avoids a surprise crash if it turns out to matter).
+#
+# Also auto-enables LichtFeld's TCP signals/events feature whenever
+# --headless is passed, so a local LichtFeld Studio GUI can connect to
+# this pod and watch training live (see the Dockerfile's EXPOSE comment
+# and the README's RunPod port-mapping section for the other half of this
+# setup). Skipped automatically if you already passed --tcp-connection
+# yourself, or if you set LFS_NO_TCP=1. Ports default to the values baked
+# in at image build time (LFS_TCP_SERVER_PORT / LFS_TCP_BROADCAST_PORT,
+# 8090/8091 unless overridden) - override per-run by exporting those same
+# env vars before calling this wrapper.
+set -euo pipefail
+
+BIN="$(cat /opt/lichtfeld/.entrypoint-bin 2>/dev/null || true)"
+if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+    BIN="$(find /opt/lichtfeld/bin -maxdepth 1 -type f -executable | head -n1)"
+fi
+
+ARGS=("$@")
+HAS_HEADLESS=0
+HAS_TCP=0
+for a in "${ARGS[@]}"; do
+    [ "$a" = "--headless" ] && HAS_HEADLESS=1
+    [ "$a" = "--tcp-connection" ] && HAS_TCP=1
+done
+
+if [ "$HAS_HEADLESS" -eq 1 ] && [ "$HAS_TCP" -eq 0 ] && [ -z "${LFS_NO_TCP:-}" ]; then
+    ARGS+=(--tcp-connection
+           --tcp-server-port "${LFS_TCP_SERVER_PORT:-8090}"
+           --tcp-broadcast-port "${LFS_TCP_BROADCAST_PORT:-8091}")
+fi
+
+if [ -z "${DISPLAY:-}" ]; then
+    exec xvfb-run -a "$BIN" "${ARGS[@]}"
+else
+    exec "$BIN" "${ARGS[@]}"
+fi
