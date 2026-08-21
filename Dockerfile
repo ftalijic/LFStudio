@@ -38,8 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates gnupg wget curl git zip unzip tar pkg-config \
         build-essential \
         gcc-14 g++-14 gfortran-14 \
-        ninja-build nasm python3 python3-pip \
-        autoconf autoconf-archive automake libtool \
+        ninja-build python3 python3-pip \
         libglu1-mesa-dev libgtk-3-dev xorg-dev libgl1-mesa-dev libegl1-mesa-dev \
         libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
@@ -67,18 +66,40 @@ RUN git clone --recursive https://github.com/MrNeRF/LichtFeld-Studio.git . \
     && git checkout ${LFS_REF} \
     && git submodule update --init --recursive
 
-# vcpkg's own binary cache, backed by the GitHub Actions cache service
-# (secrets mounted below, exported by the workflow's "Export GitHub
-# Actions cache variables" step). This caches per-PACKAGE build output,
-# independent of Docker's own layer cache - so if a transient failure
-# (like a flaky mirror mid-download) kills the install after 50 of 86
-# packages already built successfully, a retry restores those 50 from
-# cache instead of recompiling them, and only rebuilds what's left.
-RUN --mount=type=secret,id=actions_cache_url \
-    --mount=type=secret,id=actions_runtime_token \
-    export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url 2>/dev/null || true)" \
-    && export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token 2>/dev/null || true)" \
-    && export VCPKG_BINARY_SOURCES="clear;x-gha,readwrite" \
+# Build flags:
+#   BUILD_CUDA_PTX_ONLY + BUILD_PORTABLE: JIT PTX at first run instead of
+#     baking one fixed SM target, so this one image works whatever GPU
+#     model RunPod happens to hand you (chosen over pinning to a single
+#     GPU's compute capability).
+#   BUILD_CUDA_MIN_SM=75: matches LichtFeld's own default minimum (SM 7.5),
+#     set explicitly here for clarity rather than relying on the default.
+#   CUDA_DEVICE_DEBUG=OFF: CMakeLists.txt defaults this ON, which ships a
+#     -G debug-instrumented (much slower) CUDA binary - turned off since
+#     this image is for actual training runs, not debugging LichtFeld itself.
+#   BUILD_PYTHON_STUBS=OFF: defaults ON upstream (src/python/CMakeLists.txt)
+#     and is wired as an ALL target, so it normally blocks the whole build.
+#     Generating the stubs requires actually importing the freshly-built
+#     `lichtfeld` Python module, which dlopens libcuda.so.1 - the real NVIDIA
+#     driver's library, not something the CUDA *toolkit* ships. GitHub's
+#     runners have no GPU/driver, so that import always fails here. This
+#     only skips optional IDE autocomplete stub files, not the actual binary
+#     or its CUDA functionality at runtime on RunPod (where a real driver is
+#     present).
+#
+# The two --mount=type=cache mounts give vcpkg's own binary/download cache a
+# home that BuildKit can persist across builds (the workflow's
+# buildkit-cache-dance step saves/restores these via actions/cache - a plain
+# --mount=type=cache alone resets on every GitHub Actions run, since each job
+# gets a fresh builder). Without this, all ~89 vcpkg packages - including
+# USD, the single slowest one - rebuild from scratch on every image rebuild.
+# (An earlier attempt used vcpkg's `x-gha` binary-caching backend directly -
+# that backend was silently removed from vcpkg and only printed a warning,
+# so it never actually cached anything; this replaces it with vcpkg's
+# `files` backend pointed at these cache-mount directories instead.)
+RUN --mount=type=cache,target=/vcpkg-binary-cache \
+    --mount=type=cache,target=/vcpkg-downloads-cache \
+    export VCPKG_BINARY_SOURCES="clear;files,/vcpkg-binary-cache,readwrite" \
+    && export VCPKG_DOWNLOADS=/vcpkg-downloads-cache \
     && cmake -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
@@ -87,6 +108,7 @@ RUN --mount=type=secret,id=actions_cache_url \
         -DBUILD_CUDA_MIN_SM=75 \
         -DCUDA_DEVICE_DEBUG=OFF \
         -DBUILD_TESTS=OFF \
+        -DBUILD_PYTHON_STUBS=OFF \
     && cmake --build build -- -j$(nproc) \
     && cmake --install build --prefix /opt/lichtfeld \
     && rm -rf ${VCPKG_ROOT}/buildtrees ${VCPKG_ROOT}/downloads build
