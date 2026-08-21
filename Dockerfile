@@ -38,7 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates gnupg wget curl git zip unzip tar pkg-config \
         build-essential \
         gcc-14 g++-14 gfortran-14 \
-        ninja-build python3 python3-pip \
+        ninja-build nasm python3 python3-pip \
+        autoconf autoconf-archive automake libtool \
         libglu1-mesa-dev libgtk-3-dev xorg-dev libgl1-mesa-dev libegl1-mesa-dev \
         libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
