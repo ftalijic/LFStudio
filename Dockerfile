@@ -247,8 +247,23 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base \
     && test -n "$COLMAP_BIN" || (echo "ERROR: colmap binary not found in dakord/oblaq-colmap-base:latest" >&2 && exit 1) \
     && mkdir -p /opt/colmap/bin /opt/colmap/vendor-libs /opt/colmap/share \
     && cp -L "$COLMAP_BIN" /opt/colmap/bin/colmap \
+    # ldd here runs under THIS stage's own dynamic linker config, not
+    # colmap-base's - it has no idea colmap-base registered a non-standard
+    # path for cuDSS (its Dockerfile does
+    # `echo /usr/lib/x86_64-linux-gnu/libcudss/13 > /etc/ld.so.conf.d/cudss.conf`,
+    # a registration that lives inside colmap-base's own filesystem, invisible
+    # from here). Without this, ldd would silently report cuDSS as "not
+    # found", it'd get dropped by the grep '^/' filter below, and colmap
+    # would build+push fine here but fail to dlopen cuDSS the first time it
+    # actually runs on a pod. Explicitly pointing LD_LIBRARY_PATH at
+    # colmap-base's known non-default lib dirs (via the bind-mount path)
+    # makes ldd resolve against the real filesystem the binary came from.
+    && export LD_LIBRARY_PATH="/colmap-base/usr/local/lib:/colmap-base/usr/lib/x86_64-linux-gnu:/colmap-base/usr/lib/x86_64-linux-gnu/libcudss/13:/colmap-base/lib/x86_64-linux-gnu:/colmap-base/lib" \
     && ldd "$COLMAP_BIN" | awk '{print $3}' | grep '^/' | sort -u \
         | xargs -I{} sh -c 'cp -L {} /opt/colmap/vendor-libs/ 2>/dev/null || true' \
+    && (ldd "$COLMAP_BIN" | grep -i "not found" \
+        && echo "WARNING: colmap has unresolved shared library dependencies listed above - it will likely fail to run on the pod, LD_LIBRARY_PATH above needs another entry" \
+        || true) \
     && VOCAB_FILES="$(find /colmap-base -iname '*vocab*tree*' -type f 2>/dev/null)" \
     && if [ -n "$VOCAB_FILES" ]; then \
          echo "$VOCAB_FILES" | xargs -I{} cp -L {} /opt/colmap/share/; \
