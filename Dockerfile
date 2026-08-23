@@ -241,34 +241,58 @@ ENV PATH="/opt/lichtfeld/bin:/opt/lichtfeld/vendor-libs:${PATH}"
 # though the oblaQ pipeline already runs this same image across RunPod's
 # GPU fleet in production, which is real-world evidence it's fine in
 # practice.
-RUN --mount=type=bind,from=colmap-base,target=/colmap-base \
+# The ,rw here is required: a bind mount is read-only by default (per
+# BuildKit's own docs), and chroot'ing into it means glibc's own `ldd`
+# script - which does `> /dev/null` internally - fails outright with
+# "/dev/null: Read-only file system" and then misreports the target as
+# "not a dynamic executable" (caught via the fast standalone
+# Dockerfile.colmap-test, not this 60-90 min build - that's exactly why
+# that test file exists). rw only affects this RUN instruction (nothing
+# written here is committed to any layer); nothing actually needs to be
+# written back into colmap-base, this is purely so ldd's own internal
+# housekeeping succeeds.
+RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
     COLMAP_BIN="$(find /colmap-base -maxdepth 5 -type f -name colmap -executable 2>/dev/null | head -n1)" \
     && test -n "$COLMAP_BIN" || (echo "ERROR: colmap binary not found in dakord/oblaq-colmap-base:latest" >&2 && exit 1) \
     && mkdir -p /opt/colmap/bin /opt/colmap/vendor-libs /opt/colmap/share \
     && cp -L "$COLMAP_BIN" /opt/colmap/bin/colmap \
-    # ldd here runs under THIS stage's own dynamic linker config, not
-    # colmap-base's - it has no idea colmap-base registered a non-standard
-    # path for cuDSS (its Dockerfile does
-    # `echo /usr/lib/x86_64-linux-gnu/libcudss/13 > /etc/ld.so.conf.d/cudss.conf`,
-    # a registration that lives inside colmap-base's own filesystem, invisible
-    # from here). Without this, ldd would silently report cuDSS as "not
-    # found", it'd get dropped by the grep '^/' filter below, and colmap
-    # would build+push fine here but fail to dlopen cuDSS the first time it
-    # actually runs on a pod. Explicitly pointing LD_LIBRARY_PATH at
-    # colmap-base's known non-default lib dirs (via the bind-mount path)
-    # makes ldd resolve against the real filesystem the binary came from.
-    # IMPORTANT: this is prefixed onto the ldd command only (VAR=val cmd),
-    # NOT `export`ed - a first attempt used export, which then also applied
-    # to every OTHER command below (sort, awk, xargs, grep, even bash via
-    # xargs' `sh -c`). Those immediately tried to load colmap-base's own
-    # OLDER glibc from the path just added and failed outright with
-    # "GLIBC_2.38 not found" - confirmed directly from a real build log,
-    # not theoretical. Scoping to just this one command avoids that.
-    && COLMAP_LIBS="$(LD_LIBRARY_PATH="/colmap-base/usr/local/lib:/colmap-base/usr/lib/x86_64-linux-gnu:/colmap-base/usr/lib/x86_64-linux-gnu/libcudss/13:/colmap-base/lib/x86_64-linux-gnu:/colmap-base/lib" ldd "$COLMAP_BIN")" \
-    && echo "$COLMAP_LIBS" | awk '{print $3}' | grep '^/' | sort -u \
-        | xargs -I{} sh -c 'cp -L {} /opt/colmap/vendor-libs/ 2>/dev/null || true' \
+    # Two earlier attempts here both broke on the same root cause: ldd needs
+    # to resolve against colmap-base's OWN glibc/ld.so.cache (which already
+    # has cuDSS's non-standard path registered via its own Dockerfile's
+    # `ldconfig` run), not this stage's. Pointing LD_LIBRARY_PATH at
+    # colmap-base's lib dirs looked like the fix, but `ldd` is itself a bash
+    # script - even scoping the env var to just that one command still
+    # poisons the /bin/bash process ldd execs internally, which then tries
+    # to resolve ITS OWN libc.so.6 through that same search path and picks
+    # up colmap-base's older (Ubuntu 22.04/glibc 2.35) one instead of this
+    # stage's - confirmed directly from two separate failed build logs,
+    # both crashing on "GLIBC_2.38 not found (required by /bin/bash)".
+    # chroot sidesteps this entirely: colmap-base's own ldd, bash, and libc
+    # all come from the SAME consistent filesystem, so nothing gets mixed,
+    # and its own ld.so.cache is used automatically - no LD_LIBRARY_PATH
+    # needed at all anymore. ldd's output paths are then relative to that
+    # chroot, so they get re-prefixed with /colmap-base to `cp` them out.
+    && command -v chroot >/dev/null || (echo "ERROR: chroot not available in the runtime base image" >&2 && exit 1) \
+    && COLMAP_REL="${COLMAP_BIN#/colmap-base}" \
+    && COLMAP_LIBS="$(chroot /colmap-base ldd "$COLMAP_REL")" \
+    # Exclude glibc's own core libs (and the C++/GCC runtime) from what gets
+    # vendored - colmap-base is Ubuntu 22.04/glibc 2.35, this runtime stage
+    # is Ubuntu 24.04/glibc 2.39, and ldd will list colmap's libc.so.6 as a
+    # dependency same as any dynamically-linked binary. Copying THAT older
+    # libc into /opt/colmap/vendor-libs and putting it on LD_LIBRARY_PATH
+    # would shadow the correct newer glibc for every OTHER process on the
+    # pod (not just colmap), reproducing the exact same GLIBC-mismatch crash
+    # this whole step already broke on twice - just silently, at pod runtime
+    # instead of build time. Standard practice for any cross-distro binary
+    # vendoring (AppImage/linuxdeploy do the same) - only colmap's genuine
+    # third-party deps (Ceres, cuDSS, Boost, Qt5, OpenCV, etc.) get copied;
+    # glibc/libstdc++/libgcc_s always come from the destination image itself.
+    && echo "$COLMAP_LIBS" | awk '{print $3}' | grep '^/' \
+        | grep -vE '/(libc|libm|libpthread|libdl|librt|libresolv|libnsl|libutil|libcrypt|ld-linux[^/]*|libstdc\+\+|libgcc_s)\.so' \
+        | sort -u \
+        | xargs -I{} sh -c 'cp -L "/colmap-base{}" /opt/colmap/vendor-libs/ 2>/dev/null || true' \
     && (echo "$COLMAP_LIBS" | grep -i "not found" \
-        && echo "WARNING: colmap has unresolved shared library dependencies listed above - it will likely fail to run on the pod, LD_LIBRARY_PATH above needs another entry" \
+        && echo "WARNING: colmap has unresolved shared library dependencies listed above - it will likely fail to run on the pod" \
         || true) \
     && VOCAB_FILES="$(find /colmap-base -iname '*vocab*tree*' -type f 2>/dev/null)" \
     && if [ -n "$VOCAB_FILES" ]; then \
