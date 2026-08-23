@@ -1,29 +1,99 @@
-name: Test COLMAP bundling step
-
-# Manual only - this is a standalone test of Dockerfile.colmap-test, not
-# something that should fire on every push. Builds in a couple minutes
-# (two base image pulls + one RUN step) instead of the ~60-90 min full
-# LichtFeld build, specifically so the COLMAP step can be iterated on
-# without paying that cost every time.
+# Build and push LichtFeld Studio image
+ 
+name: Build and push LichtFeld Studio image
+ 
 on:
   workflow_dispatch:
-
+    inputs:
+      lfs_ref:
+        description: "LichtFeld-Studio git ref to build (branch, tag, or commit SHA)"
+        required: false
+        default: "master"
+  push:
+    branches: [main, master]
+    paths:
+      - "Dockerfile"
+      - "start.sh"
+      - "lichtfeld-headless"
+      - ".github/workflows/build-image.yml"
+ 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-
+ 
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+ 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Build and run COLMAP test
+ 
+      - name: Restore vcpkg build cache
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: cache-mount
+          key: vcpkg-cache-${{ hashFiles('Dockerfile') }}
+          restore-keys: |
+            vcpkg-cache-
+ 
+      - name: Inject vcpkg cache into builder
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          # cache-dir: without this, buildkit-cache-dance treats each
+          # cache-map KEY below ("vcpkg-binary", "vcpkg-downloads") as its
+          # own standalone path directly under the workspace root - i.e. it
+          # extracts to ./vcpkg-binary and ./vcpkg-downloads, NOT under
+          # ./cache-mount. The "Restore vcpkg build cache" step above only
+          # saves path: cache-mount, so those never overlapped - actions/cache
+          # was saving an empty cache-mount/ every single run. Confirmed
+          # directly: the repo's Actions caches list had 26 entries, all
+          # buildkit-blob-* (the unrelated Docker layer cache), zero
+          # vcpkg-cache-* ever, even from runs that fully completed. This
+          # nests both cache-map paths under cache-mount/ instead, matching
+          # what the restore step above actually persists.
+          cache-dir: cache-mount
+          # save-always: buildkit-cache-dance's own post-step (the part that
+          # actually copies the BuildKit cache-mount contents back out so
+          # actions/cache above can persist them) only runs by default when
+          # the whole job succeeds (its action.yml sets
+          # post-if: "success() || save-always"). Keeps partial vcpkg
+          # progress from being lost to an unrelated later failure.
+          save-always: true
+          cache-map: |
+            {
+              "vcpkg-binary": "/vcpkg-binary-cache",
+              "vcpkg-downloads": "/vcpkg-downloads-cache"
+            }
+          skip-extraction: ${{ steps.vcpkg-cache.outputs.cache-hit }}
+ 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+ 
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.colmap-test
-          push: false
-          load: false
+          push: true
+          build-args: |
+            LFS_REF=${{ github.event.inputs.lfs_ref || 'master' }}
+          tags: |
+            dakord/lichtfeld-studio:latest
+            dakord/lichtfeld-studio:${{ github.run_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
