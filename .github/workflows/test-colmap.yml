@@ -1,0 +1,29 @@
+name: Test COLMAP bundling step
+
+# Manual only - this is a standalone test of Dockerfile.colmap-test, not
+# something that should fire on every push. Builds in a couple minutes
+# (two base image pulls + one RUN step) instead of the ~60-90 min full
+# LichtFeld build, specifically so the COLMAP step can be iterated on
+# without paying that cost every time.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and run COLMAP test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.colmap-test
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
