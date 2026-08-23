@@ -20,7 +20,15 @@ FROM dakord/oblaq-colmap-base:latest AS colmap-base
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04 AS test
 
-RUN --mount=type=bind,from=colmap-base,target=/colmap-base \
+# The ,rw here is required: a bind mount is read-only by default (per
+# BuildKit's own docs), and chroot'ing into it means glibc's own `ldd`
+# script - which does `> /dev/null` internally - fails outright with
+# "/dev/null: Read-only file system" and then misreports the target as
+# "not a dynamic executable". rw only affects this RUN instruction (nothing
+# written here is committed to any layer), and we're not relying on
+# anything actually being written back into colmap-base anyway - this is
+# purely to let ldd's own internal housekeeping succeed.
+RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
     COLMAP_BIN="$(find /colmap-base -maxdepth 5 -type f -name colmap -executable 2>/dev/null | head -n1)" \
     && test -n "$COLMAP_BIN" || (echo "ERROR: colmap binary not found in dakord/oblaq-colmap-base:latest" >&2 && exit 1) \
     && mkdir -p /opt/colmap/bin /opt/colmap/vendor-libs /opt/colmap/share \
