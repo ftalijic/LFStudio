@@ -1,4 +1,3 @@
-
 # syntax=docker/dockerfile:1
 #
 # LichtFeld Studio, baked into a reusable RunPod image.
@@ -17,19 +16,19 @@
 # debugged once (a first deploy hit "Connection refused" until
 # openssh-server + the $PUBLIC_KEY-at-container-start dance were added), so
 # this reuses the same proven pattern instead of re-discovering it.
- 
+
 ########################################
 # Stage 1: builder
 ########################################
 ARG CUDA_VERSION=12.8.0
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS builder
- 
+
 # Which LichtFeld-Studio git ref to build. Override at build time with
 # --build-arg LFS_REF=v0.5.2 (or a commit SHA) to pin an exact version
 # instead of always tracking master.
 ARG LFS_REF=master
 ENV DEBIAN_FRONTEND=noninteractive
- 
+
 # GCC 14 installs directly via apt on Ubuntu 24.04+ (per the project's own
 # Linux build wiki - no PPA needed here, unlike older Ubuntu releases).
 # The X11/GL/GTK -dev packages are needed at BUILD/link time even for a
@@ -60,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100 \
     && rm -rf /var/lib/apt/lists/*
- 
+
 # Modern CMake from Kitware directly - mirrors what LichtFeld's own
 # docker/Dockerfile does (it explicitly pulls CMake 4.0.3 rather than
 # trusting Ubuntu 24.04's packaged 3.28, which is a signal their
@@ -71,17 +70,17 @@ RUN wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc \
         > /etc/apt/sources.list.d/kitware.list \
     && apt-get update && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
- 
+
 ENV VCPKG_ROOT=/opt/vcpkg
 RUN git clone https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
     && ${VCPKG_ROOT}/bootstrap-vcpkg.sh -disableMetrics
 ENV PATH="${VCPKG_ROOT}:${PATH}"
- 
+
 WORKDIR /opt/src
 RUN git clone --recursive https://github.com/MrNeRF/LichtFeld-Studio.git . \
     && git checkout ${LFS_REF} \
     && git submodule update --init --recursive
- 
+
 # LichtFeld's own build hardcodes -march=native for Release builds
 # (src/core/CMakeLists.txt, confirmed by reading it directly) - no CMake
 # option exposes it, so it has to be patched here. -march=native bakes in
@@ -94,7 +93,7 @@ RUN git clone --recursive https://github.com/MrNeRF/LichtFeld-Studio.git . \
 # supports, and consistent with the -mavx2 -mfma the project already opts
 # into explicitly a few lines below the -march=native line in that same file.
 RUN sed -i 's/-march=native/-march=x86-64-v3/' src/core/CMakeLists.txt
- 
+
 # Build flags:
 #   BUILD_CUDA_PTX_ONLY + BUILD_PORTABLE: JIT PTX at first run instead of
 #     baking one fixed SM target, so this one image works whatever GPU
@@ -141,7 +140,7 @@ RUN --mount=type=cache,target=/vcpkg-binary-cache \
     && cmake --build build -- -j$(nproc) \
     && cmake --install build --prefix /opt/lichtfeld \
     && rm -rf ${VCPKG_ROOT}/buildtrees ${VCPKG_ROOT}/downloads build
- 
+
 # Discover the actual runtime .so closure via ldd instead of guessing which
 # apt runtime packages the binary needs - copies every non-system shared
 # library the built binary links against into a vendor-libs dir that ships
@@ -152,7 +151,7 @@ RUN BIN="$(find /opt/lichtfeld/bin -maxdepth 1 -type f -executable | head -n1)" 
     && mkdir -p /opt/lichtfeld/vendor-libs \
     && ldd "$BIN" | awk '{print $3}' | grep '^/' | sort -u \
         | xargs -I{} sh -c 'cp -L {} /opt/lichtfeld/vendor-libs/ 2>/dev/null || true'
- 
+
 ########################################
 # Stage: COLMAP (reused from oblaQ's existing CUDA-enabled build)
 ########################################
@@ -161,15 +160,15 @@ RUN BIN="$(find /opt/lichtfeld/bin -maxdepth 1 -type f -executable | head -n1)" 
 # binary, its vocab tree, and its runtime .so closure, without copying this
 # whole ~660MB image into a layer.
 FROM dakord/oblaq-colmap-base:latest AS colmap-base
- 
+
 ########################################
 # Stage 2: runtime
 ########################################
 ARG CUDA_VERSION=12.8.0
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04 AS runtime
- 
+
 ENV DEBIAN_FRONTEND=noninteractive
- 
+
 # openssh-server: NOT included by default, and RunPod only auto-configures
 # SSH for its own stock templates - a custom image needs this added
 # explicitly (see the header comment / oblaQ's prior COLMAP-base image,
@@ -220,11 +219,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir --break-system-packages gdown
- 
+
 COPY --from=builder /opt/lichtfeld /opt/lichtfeld
 ENV LD_LIBRARY_PATH="/opt/lichtfeld/lib:/opt/lichtfeld/vendor-libs:${LD_LIBRARY_PATH}"
 ENV PATH="/opt/lichtfeld/bin:/opt/lichtfeld/vendor-libs:${PATH}"
- 
+
 # COLMAP: reused from oblaQ's already-built, already-proven CUDA-enabled
 # COLMAP 4.1.1 image (dakord/oblaq-colmap-base) instead of compiling it from
 # source here - a from-source COLMAP build needs Ceres, Qt6, CGAL, boost,
@@ -258,10 +257,17 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base \
     # actually runs on a pod. Explicitly pointing LD_LIBRARY_PATH at
     # colmap-base's known non-default lib dirs (via the bind-mount path)
     # makes ldd resolve against the real filesystem the binary came from.
-    && export LD_LIBRARY_PATH="/colmap-base/usr/local/lib:/colmap-base/usr/lib/x86_64-linux-gnu:/colmap-base/usr/lib/x86_64-linux-gnu/libcudss/13:/colmap-base/lib/x86_64-linux-gnu:/colmap-base/lib" \
-    && ldd "$COLMAP_BIN" | awk '{print $3}' | grep '^/' | sort -u \
+    # IMPORTANT: this is prefixed onto the ldd command only (VAR=val cmd),
+    # NOT `export`ed - a first attempt used export, which then also applied
+    # to every OTHER command below (sort, awk, xargs, grep, even bash via
+    # xargs' `sh -c`). Those immediately tried to load colmap-base's own
+    # OLDER glibc from the path just added and failed outright with
+    # "GLIBC_2.38 not found" - confirmed directly from a real build log,
+    # not theoretical. Scoping to just this one command avoids that.
+    && COLMAP_LIBS="$(LD_LIBRARY_PATH="/colmap-base/usr/local/lib:/colmap-base/usr/lib/x86_64-linux-gnu:/colmap-base/usr/lib/x86_64-linux-gnu/libcudss/13:/colmap-base/lib/x86_64-linux-gnu:/colmap-base/lib" ldd "$COLMAP_BIN")" \
+    && echo "$COLMAP_LIBS" | awk '{print $3}' | grep '^/' | sort -u \
         | xargs -I{} sh -c 'cp -L {} /opt/colmap/vendor-libs/ 2>/dev/null || true' \
-    && (ldd "$COLMAP_BIN" | grep -i "not found" \
+    && (echo "$COLMAP_LIBS" | grep -i "not found" \
         && echo "WARNING: colmap has unresolved shared library dependencies listed above - it will likely fail to run on the pod, LD_LIBRARY_PATH above needs another entry" \
         || true) \
     && VOCAB_FILES="$(find /colmap-base -iname '*vocab*tree*' -type f 2>/dev/null)" \
@@ -272,10 +278,10 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base \
        fi
 ENV LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}"
 ENV PATH="/opt/colmap/bin:${PATH}"
- 
+
 COPY lichtfeld-headless /usr/local/bin/lichtfeld-headless
 RUN chmod +x /usr/local/bin/lichtfeld-headless
- 
+
 # Live training monitor: LichtFeld's CLI has an undocumented (not in the
 # wiki, confirmed only by reading argument_parser.cpp) TCP signals/events
 # feature - `--tcp-connection --tcp-server-port <p> --tcp-broadcast-port
@@ -293,14 +299,14 @@ ARG LFS_TCP_BROADCAST_PORT=8091
 ENV LFS_TCP_SERVER_PORT=${LFS_TCP_SERVER_PORT}
 ENV LFS_TCP_BROADCAST_PORT=${LFS_TCP_BROADCAST_PORT}
 EXPOSE ${LFS_TCP_SERVER_PORT} ${LFS_TCP_BROADCAST_PORT}
- 
+
 # --- SSH setup (build-time config; runtime key injection happens in start.sh) ---
 RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh \
     && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
     && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
- 
+
 COPY start.sh /root/start.sh
 RUN chmod +x /root/start.sh
- 
+
 WORKDIR /root
 ENTRYPOINT ["/root/start.sh"]
