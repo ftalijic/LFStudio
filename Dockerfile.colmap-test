@@ -59,7 +59,15 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
     && echo "$COLMAP_LIBS" | awk '{print $3}' | grep '^/' \
         | grep -vE '/(libc|libm|libpthread|libdl|librt|libresolv|libnsl|libutil|libcrypt|ld-linux[^/]*|libstdc\+\+|libgcc_s)\.so' \
         | sort -u \
-        | xargs -I{} sh -c 'cp -L "/colmap-base{}" /opt/colmap/vendor-libs/ 2>/dev/null || true' \
+        | xargs -I{} sh -c 'cp -L "/colmap-base{}" /opt/colmap/vendor-libs/ 2>/dev/null || echo "VENDOR COPY FAILED: {}" >&2' \
+    # Diagnostic for the "chroot resolves it fine but the destination image
+    # still says not found" mystery: print exactly what got copied (or
+    # failed to copy, per the echo above - the copy step used to swallow
+    # failures with `|| true`) BEFORE the destination-image check below,
+    # so this always shows even if that later check fails and aborts the
+    # build. Answers directly: did the file make it into vendor-libs at all?
+    && echo "=== vendor-libs contents right after copying, before any check ===" \
+    && ls -la /opt/colmap/vendor-libs \
     # Kept in sync with the main Dockerfile's hardened version of this
     # check. Rewritten from the earlier `(X && (echo E; exit 1) || true)`
     # form to a plain if/exit: that form ALWAYS exited 0 regardless of
