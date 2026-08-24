@@ -197,6 +197,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # htop, nano, vim, wget: not strictly required, but included because
 # LichtFeld's own dev Dockerfile (docker/Dockerfile upstream) ships all
 # four - matching that rather than guessing, and they're cheap.
+# libglew2.2: colmap's feature_extractor dlopens GLEW for its SiftGPU path
+# rather than linking it directly - confirmed by hitting "error while
+# loading shared libraries: libGLEW.so.2.2" on a real pod even though the
+# ldd-driven vendoring above ran clean (ldd only sees direct link
+# dependencies, not dlopen'd ones, so it can't catch this class of
+# missing lib). Installed explicitly here rather than relying on
+# vendoring to happen to catch it.
 # libcudnn9-cuda-12: ONNX Runtime's CUDA execution provider needs this at
 # actual runtime, not just at build time. LFS's own CMakeLists.txt portable-
 # bundling logic deliberately EXCLUDES anything under /usr/lib* from being
@@ -212,6 +219,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 \
         libgomp1 libgfortran5 \
         libcudnn9-cuda-12 \
+        libglew2.2 \
         xvfb xauth \
         zip unzip wget \
         tmux htop nano vim \
@@ -291,8 +299,19 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
         | grep -vE '/(libc|libm|libpthread|libdl|librt|libresolv|libnsl|libutil|libcrypt|ld-linux[^/]*|libstdc\+\+|libgcc_s)\.so' \
         | sort -u \
         | xargs -I{} sh -c 'cp -L "/colmap-base{}" /opt/colmap/vendor-libs/ 2>/dev/null || true' \
+    # Was warning-only; upgraded to a hard failure once colmap-base v5's
+    # jump to CUDA 13.0/Ubuntu 22.04 (from whatever this was last built
+    # against) made an actual mismatch here plausible rather than
+    # hypothetical - colmap-base's own header comment flags dependent
+    # images as needing "matching updates... not done" yet. A silent
+    # warning here means a broken image still reports build success;
+    # this way a bad dependency closure fails the build instead of
+    # surfacing on a paid GPU pod. This checks resolution INSIDE
+    # colmap-base's own chroot (i.e. is colmap-base itself broken) -
+    # see the second check below, after the wrapper, for whether the
+    # ASSEMBLED vendor-libs resolves in THIS (destination) image.
     && (echo "$COLMAP_LIBS" | grep -i "not found" \
-        && echo "WARNING: colmap has unresolved shared library dependencies listed above - it will likely fail to run on the pod" \
+        && (echo "ERROR: colmap has unresolved shared library dependencies even inside colmap-base's own chroot - see above" >&2 && exit 1) \
         || true) \
     && VOCAB_FILES="$(find /colmap-base -iname '*vocab*tree*' -type f 2>/dev/null)" \
     && if [ -n "$VOCAB_FILES" ]; then \
@@ -300,8 +319,48 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
        else \
          echo "WARNING: no vocab tree file found in dakord/oblaq-colmap-base:latest - vocab-tree matching won't be available, exhaustive/sequential matchers still work fine"; \
        fi
-ENV LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}"
-ENV PATH="/opt/colmap/bin:${PATH}"
+# Deliberately NOT putting /opt/colmap/bin on PATH or vendor-libs on
+# LD_LIBRARY_PATH globally, unlike the LichtFeld binary above - two real
+# problems hit on an actual running pod:
+#   1. PATH doesn't survive reliably: this same ENV PATH addition was set
+#      at image build time, yet a freshly-opened SSH session on a live pod
+#      still reported "colmap: command not found" - PAM/profile handling
+#      on login can reset PATH per-session regardless of what the
+#      container's default env declares.
+#   2. LD_LIBRARY_PATH pollutes the whole container: colmap-base is Ubuntu
+#      22.04 and its vendored libs include an older liblzma.so.5 than this
+#      (Ubuntu 24.04) runtime stage ships. With vendor-libs on
+#      LD_LIBRARY_PATH globally, that older liblzma shadows the system one
+#      for EVERY process, not just colmap - confirmed directly: apt-get
+#      install broke mid-session with "version 'XZ_5.4' not found" because
+#      dpkg-deb picked up the shadowed lib.
+# A thin wrapper at /usr/local/bin/colmap avoids both: /usr/local/bin is
+# already on the default PATH for every login mechanism (nothing extra to
+# set), and LD_LIBRARY_PATH is scoped to just this one exec instead of the
+# whole shell environment.
+RUN printf '#!/bin/sh\nexec env LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" /opt/colmap/bin/colmap "$@"\n' \
+        > /usr/local/bin/colmap \
+    && chmod +x /usr/local/bin/colmap
+
+# Second, complementary check to the one in the vendoring step above: that
+# one verifies colmap-base's OWN chroot can resolve every dependency (is
+# colmap-base itself broken); this one verifies the ASSEMBLED
+# /opt/colmap/vendor-libs actually resolves everything in THIS
+# (destination) image, which is the check that actually determines
+# whether colmap runs on the pod - colmap-base is Ubuntu 22.04, this
+# stage is 24.04, so a clean chroot resolution does not guarantee a clean
+# destination resolution. Mirrors Dockerfile.colmap-test's own smoke
+# test, run for real here so a broken dependency closure fails THIS
+# build too, not just the separate fast test someone has to remember to
+# run first. Doesn't touch CUDA (no GPU on a GitHub Actions runner), but
+# exercises every CPU-side dynamic library colmap needs - won't catch a
+# dlopen'd-only dependency like libGLEW.so.2.2 (ldd only sees direct
+# link-time deps), so that class of bug still needs a real pod test.
+RUN (LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/colmap/bin/colmap | grep -i "not found" \
+        && (echo "ERROR: colmap has unresolved shared library dependencies in the assembled destination image - see above" >&2 && exit 1) \
+        || echo "OK: colmap's dependency closure resolves cleanly in the destination image") \
+    && colmap -h >/dev/null \
+    && echo "OK: colmap -h runs via the /usr/local/bin wrapper"
 
 COPY lichtfeld-headless /usr/local/bin/lichtfeld-headless
 RUN chmod +x /usr/local/bin/lichtfeld-headless
@@ -325,9 +384,25 @@ ENV LFS_TCP_BROADCAST_PORT=${LFS_TCP_BROADCAST_PORT}
 EXPOSE ${LFS_TCP_SERVER_PORT} ${LFS_TCP_BROADCAST_PORT}
 
 # --- SSH setup (build-time config; runtime key injection happens in start.sh) ---
+# X11Forwarding: pinned explicitly rather than trusting this base image's
+# default - needed to view a GUI app (colmap gui, or the LichtFeld GUI
+# binary itself) by tunneling it through `ssh -X` to a local X server on
+# your machine (VcXsrv/Xming/MobaXterm), instead of standing up a
+# VNC/noVNC stack. Rendering happens client-side, so this needs no extra
+# EXPOSE/port-mapping - it rides the same SSH port/session already in use.
+# xauth (already installed above) is the other half this needs, for the
+# per-session MIT-MAGIC-COOKIE auth forwarding relies on.
+# Caveat: colmap's GUI links Qt5 (already vendored - see the COLMAP step's
+# comment), but Qt loads its X11 "platform plugin" (libqxcb.so) via
+# dlopen at runtime, not a normal link - the same class of blind spot
+# that made ldd-driven vendoring miss libGLEW.so.2.2 for feature_extractor.
+# Untested whether that plugin and its own deps are actually present;
+# worth an actual `colmap gui` try over ssh -X before relying on this.
 RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh \
     && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
-    && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+    && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+    && sed -i 's/X11Forwarding no/X11Forwarding yes/' /etc/ssh/sshd_config \
+    && (grep -q '^X11Forwarding yes' /etc/ssh/sshd_config || echo 'X11Forwarding yes' >> /etc/ssh/sshd_config)
 
 COPY start.sh /root/start.sh
 RUN chmod +x /root/start.sh
