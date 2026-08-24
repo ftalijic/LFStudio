@@ -161,6 +161,24 @@ RUN BIN="$(find /opt/lichtfeld/bin -maxdepth 1 -type f -executable | head -n1)" 
 # whole ~660MB image into a layer.
 FROM dakord/oblaq-colmap-base:latest AS colmap-base
 
+# `chroot` below only gets colmap-base's filesystem, not its Docker image
+# config (ENV/PATH/etc. are metadata, not files) - if colmap-base, like
+# nvidia/cuda base images generally, exposes some of its CUDA/math
+# libraries via an ENV-set LD_LIBRARY_PATH rather than (or in addition to)
+# ldconfig-registered paths, a bare chroot ldd would wrongly report those
+# "not found" even though colmap-base's own build step (`RUN colmap -h |
+# grep -q "with CUDA"`, which passed) and any real `docker run` of it
+# resolve them fine. This stage DOES see colmap-base's actual image env,
+# so its LD_LIBRARY_PATH gets captured to a file and fed into the chroot
+# ldd call below - closing that gap instead of guessing at the path.
+# This is deliberately colmap-base's OWN captured value, not some
+# externally-guessed path - it doesn't reintroduce the earlier "poisoned
+# ldd's own /bin/bash libc.so.6 resolution" GLIBC-mismatch bug described
+# in the chroot call's own comment below, because every path in it lives
+# inside this SAME chroot'd filesystem.
+FROM colmap-base AS colmap-base-env
+RUN echo "$LD_LIBRARY_PATH" > /captured_ld_library_path.txt
+
 ########################################
 # Stage 2: runtime
 ########################################
@@ -260,6 +278,7 @@ ENV PATH="/opt/lichtfeld/bin:/opt/lichtfeld/vendor-libs:${PATH}"
 # written back into colmap-base, this is purely so ldd's own internal
 # housekeeping succeeds.
 RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
+    --mount=type=bind,from=colmap-base-env,source=/captured_ld_library_path.txt,target=/captured_ld_library_path.txt \
     COLMAP_BIN="$(find /colmap-base -maxdepth 5 -type f -name colmap -executable 2>/dev/null | head -n1)" \
     && test -n "$COLMAP_BIN" || (echo "ERROR: colmap binary not found in dakord/oblaq-colmap-base:latest" >&2 && exit 1) \
     && mkdir -p /opt/colmap/bin /opt/colmap/vendor-libs /opt/colmap/share \
@@ -282,7 +301,8 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
     # chroot, so they get re-prefixed with /colmap-base to `cp` them out.
     && command -v chroot >/dev/null || (echo "ERROR: chroot not available in the runtime base image" >&2 && exit 1) \
     && COLMAP_REL="${COLMAP_BIN#/colmap-base}" \
-    && COLMAP_LIBS="$(chroot /colmap-base ldd "$COLMAP_REL")" \
+    && COLMAP_BASE_LDPATH="$(cat /captured_ld_library_path.txt)" \
+    && COLMAP_LIBS="$(chroot /colmap-base /bin/sh -c "LD_LIBRARY_PATH='$COLMAP_BASE_LDPATH' ldd '$COLMAP_REL'")" \
     # Exclude glibc's own core libs (and the C++/GCC runtime) from what gets
     # vendored - colmap-base is Ubuntu 22.04/glibc 2.35, this runtime stage
     # is Ubuntu 24.04/glibc 2.39, and ldd will list colmap's libc.so.6 as a
@@ -310,9 +330,18 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
     # colmap-base's own chroot (i.e. is colmap-base itself broken) -
     # see the second check below, after the wrapper, for whether the
     # ASSEMBLED vendor-libs resolves in THIS (destination) image.
-    && (echo "$COLMAP_LIBS" | grep -i "not found" \
-        && (echo "ERROR: colmap has unresolved shared library dependencies even inside colmap-base's own chroot - see above" >&2 && exit 1) \
-        || true) \
+    # Rewritten from the earlier `(X && (echo E; exit 1) || true)` form:
+    # that form ALWAYS exited 0 regardless of whether "not found" matched -
+    # `X && Y` counts as failed whenever Y's `exit 1` runs, which then
+    # triggers the trailing `|| true`, silently discarding the failure.
+    # Confirmed for real via Dockerfile.colmap-test's own CI run (identical
+    # pattern there): it printed the ERROR line and then reported build
+    # success anyway. `exit 1` inside an `if` body ends the whole RUN's
+    # shell script immediately, so nothing later in the chain can catch it.
+    && if echo "$COLMAP_LIBS" | grep -qi "not found"; then \
+         echo "ERROR: colmap has unresolved shared library dependencies even inside colmap-base's own chroot - see above" >&2; \
+         exit 1; \
+       fi \
     && VOCAB_FILES="$(find /colmap-base -iname '*vocab*tree*' -type f 2>/dev/null)" \
     && if [ -n "$VOCAB_FILES" ]; then \
          echo "$VOCAB_FILES" | xargs -I{} cp -L {} /opt/colmap/share/; \
@@ -356,9 +385,16 @@ RUN printf '#!/bin/sh\nexec env LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LI
 # exercises every CPU-side dynamic library colmap needs - won't catch a
 # dlopen'd-only dependency like libGLEW.so.2.2 (ldd only sees direct
 # link-time deps), so that class of bug still needs a real pod test.
-RUN (LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/colmap/bin/colmap | grep -i "not found" \
-        && (echo "ERROR: colmap has unresolved shared library dependencies in the assembled destination image - see above" >&2 && exit 1) \
-        || echo "OK: colmap's dependency closure resolves cleanly in the destination image") \
+# Rewritten from `(X && (echo E; exit1) || echo OK)`: same masking bug as
+# the vendoring-step check above - X && Y counts as failed whenever Y's
+# exit 1 runs, so the trailing `|| echo OK` fired unconditionally and this
+# check could never actually fail the build no matter what ldd reported.
+RUN if LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/colmap/bin/colmap | grep -qi "not found"; then \
+      echo "ERROR: colmap has unresolved shared library dependencies in the assembled destination image - see above" >&2; \
+      exit 1; \
+    else \
+      echo "OK: colmap's dependency closure resolves cleanly in the destination image"; \
+    fi \
     && colmap -h >/dev/null \
     && echo "OK: colmap -h runs via the /usr/local/bin wrapper"
 
