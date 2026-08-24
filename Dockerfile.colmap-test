@@ -40,8 +40,10 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
         | grep -vE '/(libc|libm|libpthread|libdl|librt|libresolv|libnsl|libutil|libcrypt|ld-linux[^/]*|libstdc\+\+|libgcc_s)\.so' \
         | sort -u \
         | xargs -I{} sh -c 'cp -L "/colmap-base{}" /opt/colmap/vendor-libs/ 2>/dev/null || true' \
+    # Kept in sync with the main Dockerfile's hardened version of this
+    # check (was warning-only) - see its comment for why.
     && (echo "$COLMAP_LIBS" | grep -i "not found" \
-        && echo "WARNING: colmap has unresolved shared library dependencies listed above - it will likely fail to run on the pod" \
+        && (echo "ERROR: colmap has unresolved shared library dependencies even inside colmap-base's own chroot - see above" >&2 && exit 1) \
         || true) \
     && VOCAB_FILES="$(find /colmap-base -iname '*vocab*tree*' -type f 2>/dev/null)" \
     && if [ -n "$VOCAB_FILES" ]; then \
@@ -50,29 +52,39 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
          echo "WARNING: no vocab tree file found in dakord/oblaq-colmap-base:latest - vocab-tree matching won't be available, exhaustive/sequential matchers still work fine"; \
        fi
 
-ENV LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}"
-ENV PATH="/opt/colmap/bin:${PATH}"
+# Matches the main Dockerfile: no global PATH/LD_LIBRARY_PATH ENV for
+# colmap (breaks SSH-session PATH persistence and shadows the system
+# liblzma.so.5 for every process via colmap-base's older vendored copy,
+# see the main Dockerfile's comment on this same step) - a
+# /usr/local/bin/colmap wrapper instead. Keep this in sync with the main
+# Dockerfile's version, per the header note above.
+RUN printf '#!/bin/sh\nexec env LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" /opt/colmap/bin/colmap "$@"\n' \
+        > /usr/local/bin/colmap \
+    && chmod +x /usr/local/bin/colmap
 
 # The actual proof: does the copied binary run at all? This is the part a
 # "the build succeeded" check does NOT cover - the COLMAP step can copy
 # files just fine and still hand you a binary that fails to load at
-# runtime, which is exactly what happened twice already. ldd here uses
-# THIS stage's own resolver deliberately (no chroot) - that's the real
-# production configuration (LD_LIBRARY_PATH + vendor-libs), so this proves
-# out the actual runtime path, not just the build-time copy step.
+# runtime, which is exactly what happened twice already. ldd here scopes
+# LD_LIBRARY_PATH to just this one invocation - that's the real production
+# configuration (see the wrapper above), so this proves out the actual
+# runtime path, not just the build-time copy step.
 # GPU access isn't available on a GitHub Actions runner (or most local
 # Docker setups), so `colmap -h` is as far as this can verify - it doesn't
 # touch CUDA, but it does exercise every CPU-side dynamic library colmap
-# needs, which is the actual thing that broke twice.
+# needs, which is the actual thing that broke twice. Note this still won't
+# catch a dlopen'd-only dependency like libGLEW.so.2.2 (see the main
+# Dockerfile's runtime apt-get list) - ldd, and by extension this whole
+# smoke test, only sees libraries linked directly at build time.
 RUN echo "=== ldd on the assembled binary (production LD_LIBRARY_PATH) ===" \
-    && ldd /opt/colmap/bin/colmap \
+    && LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/colmap/bin/colmap \
     && echo "" \
     && echo "=== checking for any unresolved dependencies ===" \
-    && (ldd /opt/colmap/bin/colmap | grep -i "not found" \
+    && (LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/colmap/bin/colmap | grep -i "not found" \
         && (echo "FAIL: unresolved dependencies listed above" >&2 && exit 1) \
         || echo "OK: nothing unresolved") \
     && echo "" \
-    && echo "=== colmap -h ===" \
+    && echo "=== colmap -h (via the /usr/local/bin wrapper, same path production uses) ===" \
     && colmap -h \
     && echo "" \
     && echo "=== vendor-libs contents ===" \
