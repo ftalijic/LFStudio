@@ -1,7 +1,8 @@
-# Build and push LichtFeld Studio image
- 
 name: Build and push LichtFeld Studio image
- 
+
+# Manual trigger by default (this is a ~60-90 min compile - not something
+# that should fire on every push by accident). Also runs automatically if
+# you edit the Dockerfile/scripts themselves.
 on:
   workflow_dispatch:
     inputs:
@@ -16,14 +17,20 @@ on:
       - "start.sh"
       - "lichtfeld-headless"
       - ".github/workflows/build-image.yml"
- 
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # GitHub's free runners are 2-core - compiling LichtFeld's CUDA/vcpkg
+    # dependency tree here will likely take longer wall-clock than it would
+    # on a beefier RunPod pod. That's the trade you're making for it being
+    # free instead of costing paid GPU-hours; layer caching below (cache-from
+    # /cache-to: type=gha) means only the FIRST build pays this in full -
+    # later rebuilds (e.g. bumping lfs_ref) reuse unchanged layers.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
- 
+
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -34,57 +41,16 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
- 
+
       - name: Set up Docker Buildx
-        id: buildx
         uses: docker/setup-buildx-action@v3
- 
-      - name: Restore vcpkg build cache
-        id: vcpkg-cache
-        uses: actions/cache@v4
-        with:
-          path: cache-mount
-          key: vcpkg-cache-${{ hashFiles('Dockerfile') }}
-          restore-keys: |
-            vcpkg-cache-
- 
-      - name: Inject vcpkg cache into builder
-        uses: reproducible-containers/buildkit-cache-dance@v3
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          # cache-dir: without this, buildkit-cache-dance treats each
-          # cache-map KEY below ("vcpkg-binary", "vcpkg-downloads") as its
-          # own standalone path directly under the workspace root - i.e. it
-          # extracts to ./vcpkg-binary and ./vcpkg-downloads, NOT under
-          # ./cache-mount. The "Restore vcpkg build cache" step above only
-          # saves path: cache-mount, so those never overlapped - actions/cache
-          # was saving an empty cache-mount/ every single run. Confirmed
-          # directly: the repo's Actions caches list had 26 entries, all
-          # buildkit-blob-* (the unrelated Docker layer cache), zero
-          # vcpkg-cache-* ever, even from runs that fully completed. This
-          # nests both cache-map paths under cache-mount/ instead, matching
-          # what the restore step above actually persists.
-          cache-dir: cache-mount
-          # save-always: buildkit-cache-dance's own post-step (the part that
-          # actually copies the BuildKit cache-mount contents back out so
-          # actions/cache above can persist them) only runs by default when
-          # the whole job succeeds (its action.yml sets
-          # post-if: "success() || save-always"). Keeps partial vcpkg
-          # progress from being lost to an unrelated later failure.
-          save-always: true
-          cache-map: |
-            {
-              "vcpkg-binary": "/vcpkg-binary-cache",
-              "vcpkg-downloads": "/vcpkg-downloads-cache"
-            }
-          skip-extraction: ${{ steps.vcpkg-cache.outputs.cache-hit }}
- 
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
- 
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
