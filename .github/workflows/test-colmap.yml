@@ -1,29 +1,51 @@
-name: Test COLMAP bundling step
+# Fast standalone check for just the COLMAP-bundling step used by the main
+# Dockerfile - skips the 60-90 min LichtFeld GCC-14/CUDA/vcpkg compile
+# entirely, so a broken COLMAP dependency closure (e.g. colmap-base
+# bumping CUDA/distro versions) surfaces in minutes instead of an hour+.
+# Referenced by name in Dockerfile.colmap-test's own header comment as
+# the no-Docker-Desktop alternative - this is that workflow.
+#
+# An earlier draft of this file (never committed) skipped the Docker Hub
+# login step - dakord/oblaq-colmap-base is a private image, so that draft
+# would have failed on a 403 pulling it, the same error hit trying this
+# build locally without credentials. Login added below.
 
-# Manual only - this is a standalone test of Dockerfile.colmap-test, not
-# something that should fire on every push. Builds in a couple minutes
-# (two base image pulls + one RUN step) instead of the ~60-90 min full
-# LichtFeld build, specifically so the COLMAP step can be iterated on
-# without paying that cost every time.
+name: Test COLMAP vendoring step
+
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    paths:
+      - "Dockerfile.colmap-test"
+      - ".github/workflows/test-colmap.yml"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and run COLMAP test
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # push: false, outputs: type=cacheonly - this test's value is
+      # entirely in whether the RUN steps inside Dockerfile.colmap-test
+      # succeed (the ldd/colmap -h checks), not in producing a usable
+      # image artifact, so nothing is pushed or loaded anywhere.
+      - name: Build and run the COLMAP vendoring test
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.colmap-test
+          file: Dockerfile.colmap-test
           push: false
-          load: false
+          outputs: type=cacheonly
           cache-from: type=gha
           cache-to: type=gha,mode=max
