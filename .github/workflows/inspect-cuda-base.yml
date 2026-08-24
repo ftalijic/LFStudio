@@ -1,0 +1,42 @@
+# One-off diagnostic - NOT part of the normal build/test pipeline.
+#
+# Question: does the official nvidia/cuda:13.0.0-runtime-ubuntu22.04 image
+# (the base oblaq-colmap-base's final stage builds FROM) actually bundle
+# libcudart/libcublas/libcusolver/liblapack/libblas, or does colmap-base's
+# own Dockerfile need to explicitly apt-get install them? Public image, no
+# Docker Hub login needed - just a plain `docker run` on GitHub's own
+# runner, which already has Docker preinstalled.
+#
+# Safe to delete this file once you have your answer - it's not wired into
+# any push/path trigger, only manual dispatch.
+name: Inspect CUDA 13.0 runtime base image
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull and inspect nvidia/cuda:13.0.0-runtime-ubuntu22.04
+        run: |
+          docker pull nvidia/cuda:13.0.0-runtime-ubuntu22.04
+
+          echo "=== ldconfig cache (what's actually resolvable without any extra env) ==="
+          docker run --rm nvidia/cuda:13.0.0-runtime-ubuntu22.04 bash -c \
+            "ldconfig -p | grep -Ei 'cudart|cublas|cusolver|lapack|blas' || echo '(none found via ldconfig)'"
+
+          echo ""
+          echo "=== installed cuda-related apt packages ==="
+          docker run --rm nvidia/cuda:13.0.0-runtime-ubuntu22.04 bash -c \
+            "dpkg -l | grep -i cuda || echo '(no cuda packages listed)'"
+
+          echo ""
+          echo "=== raw filesystem search for the specific missing sonames ==="
+          echo "(this settles it regardless of ldconfig/env-path nuances - if a file isn't found here, it genuinely isn't in the image at all)"
+          docker run --rm nvidia/cuda:13.0.0-runtime-ubuntu22.04 bash -c \
+            "find / -xdev \\( -name 'libcudart*' -o -name 'libcublas*' -o -name 'libcusolver*' -o -name 'liblapack*' -o -name 'libblas*' \\) 2>/dev/null || echo '(none found)'"
+
+          echo ""
+          echo "=== the image's own declared LD_LIBRARY_PATH ==="
+          docker run --rm nvidia/cuda:13.0.0-runtime-ubuntu22.04 bash -c 'echo "$LD_LIBRARY_PATH"'
