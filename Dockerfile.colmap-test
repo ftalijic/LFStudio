@@ -58,14 +58,38 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
     && COLMAP_LIBS="$(chroot /colmap-base /bin/sh -c "LD_LIBRARY_PATH='$COLMAP_BASE_LDPATH' ldd '$COLMAP_REL'")" \
     && echo "$COLMAP_LIBS" | awk '{print $3}' | grep '^/' \
         | grep -vE '/(libc|libm|libpthread|libdl|librt|libresolv|libnsl|libutil|libcrypt|ld-linux[^/]*|libstdc\+\+|libgcc_s)\.so' \
-        | sort -u \
-        | xargs -I{} sh -c 'cp -L "/colmap-base{}" /opt/colmap/vendor-libs/ 2>/dev/null || echo "VENDOR COPY FAILED: {}" >&2' \
-    # Diagnostic for the "chroot resolves it fine but the destination image
-    # still says not found" mystery: print exactly what got copied (or
-    # failed to copy, per the echo above - the copy step used to swallow
-    # failures with `|| true`) BEFORE the destination-image check below,
-    # so this always shows even if that later check fails and aborts the
-    # build. Answers directly: did the file make it into vendor-libs at all?
+        | sort -u > /colmap-base/tmp/colmap_vendor_libs.txt \
+    # ROOT CAUSE, confirmed via this exact diagnostic's own CI output:
+    # `cp -L "/colmap-base$path"` run out here, OUTSIDE the chroot, breaks on
+    # any path that crosses an ABSOLUTE symlink partway through - e.g.
+    # /usr/local/cuda -> /usr/local/cuda-13.0 (CUDA's own install layout) or
+    # Debian's alternatives system for libblas.so.3/liblapack.so.3. Resolved
+    # from THIS stage's real root instead of /colmap-base, that absolute
+    # symlink lands the lookup at this stage's OWN (CUDA-toolkit-less)
+    # /usr/local/cuda-13.0, which doesn't exist here - so cp failed with "No
+    # such file or directory" for a file that genuinely exists inside
+    # colmap-base. `ldd` above doesn't hit this: it runs THROUGH chroot, so
+    # every symlink it follows is already scoped to /colmap-base as root -
+    # which is exactly why the chroot-resolution check below passed clean
+    # while the copy quietly failed for libcudart.so.13, libcublas.so.13,
+    # libcublasLt.so.13, libcusolver.so.12, libnvJitLink.so.13, libblas.so.3,
+    # and liblapack.so.3 - the "VENDOR COPY FAILED" lines this diagnostic was
+    # added to surface. Fix: do the copy FROM INSIDE the chroot too (into a
+    # scratch dir), so every symlink hop resolves against the correct root,
+    # then pull that scratch dir's now-plain regular files out with a
+    # second, symlink-free cp.
+    && mkdir -p /colmap-base/tmp/vendor-out \
+    && chroot /colmap-base /bin/sh -c ' \
+         while IFS= read -r f; do \
+           [ -n "$f" ] || continue; \
+           cp -L "$f" /tmp/vendor-out/ 2>/dev/null || echo "VENDOR COPY FAILED: $f" >&2; \
+         done < /tmp/colmap_vendor_libs.txt \
+       ' \
+    && cp -a /colmap-base/tmp/vendor-out/. /opt/colmap/vendor-libs/ \
+    # Kept: prints what actually landed in vendor-libs, so a regression here
+    # (e.g. a future library newly hidden behind another symlink layer) is
+    # visible immediately instead of surfacing only as a destination-image
+    # "not found" several steps later.
     && echo "=== vendor-libs contents right after copying, before any check ===" \
     && ls -la /opt/colmap/vendor-libs \
     # Kept in sync with the main Dockerfile's hardened version of this
