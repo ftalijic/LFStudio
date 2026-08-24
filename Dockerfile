@@ -317,8 +317,35 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
     # glibc/libstdc++/libgcc_s always come from the destination image itself.
     && echo "$COLMAP_LIBS" | awk '{print $3}' | grep '^/' \
         | grep -vE '/(libc|libm|libpthread|libdl|librt|libresolv|libnsl|libutil|libcrypt|ld-linux[^/]*|libstdc\+\+|libgcc_s)\.so' \
-        | sort -u \
-        | xargs -I{} sh -c 'cp -L "/colmap-base{}" /opt/colmap/vendor-libs/ 2>/dev/null || true' \
+        | sort -u > /colmap-base/tmp/colmap_vendor_libs.txt \
+    # `cp -L "/colmap-base$path"` run out here, OUTSIDE the chroot, breaks on
+    # any path that crosses an ABSOLUTE symlink partway through - e.g.
+    # /usr/local/cuda -> /usr/local/cuda-13.0 (CUDA's own install layout) or
+    # Debian's alternatives system for libblas.so.3/liblapack.so.3. Resolved
+    # from THIS stage's real root instead of /colmap-base, that absolute
+    # symlink lands the lookup at this stage's OWN (CUDA-toolkit-less)
+    # /usr/local/cuda-13.0, which doesn't exist here - so cp fails with "No
+    # such file or directory" for a file that genuinely exists inside
+    # colmap-base. `ldd` above doesn't hit this: it runs THROUGH chroot, so
+    # every symlink it follows is already scoped to /colmap-base as root.
+    # Confirmed for real: this chroot-resolution check (below) passed clean,
+    # but a diagnostic added to Dockerfile.colmap-test showed `VENDOR COPY
+    # FAILED` for exactly the libraries that live behind such symlinks -
+    # libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libcusolver.so.12,
+    # libnvJitLink.so.13, libblas.so.3, liblapack.so.3 - while the
+    # destination-image check further down then reported those same
+    # libraries as "not found": vendor-libs never actually got them. Fix: do
+    # the copy FROM INSIDE the chroot too (into a scratch dir), so every
+    # symlink hop resolves against the correct root, then pull that scratch
+    # dir's now-plain regular files out with a second, symlink-free cp.
+    && mkdir -p /colmap-base/tmp/vendor-out \
+    && chroot /colmap-base /bin/sh -c ' \
+         while IFS= read -r f; do \
+           [ -n "$f" ] || continue; \
+           cp -L "$f" /tmp/vendor-out/ 2>/dev/null || echo "VENDOR COPY FAILED: $f" >&2; \
+         done < /tmp/colmap_vendor_libs.txt \
+       ' \
+    && cp -a /colmap-base/tmp/vendor-out/. /opt/colmap/vendor-libs/ \
     # Was warning-only; upgraded to a hard failure once colmap-base v5's
     # jump to CUDA 13.0/Ubuntu 22.04 (from whatever this was last built
     # against) made an actual mismatch here plausible rather than
