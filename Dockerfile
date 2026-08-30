@@ -16,19 +16,37 @@
 # debugged once (a first deploy hit "Connection refused" until
 # openssh-server + the $PUBLIC_KEY-at-container-start dance were added), so
 # this reuses the same proven pattern instead of re-discovering it.
+#
+# --- 2026-08-30 update ---
+# Added a live core-count fix to the /usr/local/bin/colmap wrapper below
+# (search OMP_NUM_THREADS). Root cause investigation: a full 8016-image
+# COLMAP global_mapper run was pinned to a single CPU core during its
+# "global positioning"/bundle-adjustment stages. Confirmed via live pod
+# testing that this specific Dockerfile does NOT set OMP_NUM_THREADS
+# anywhere (neither does start.sh, and colmap-base's own ENV settings
+# never reach this image - see the runtime stage's provenance note further
+# down), so the OMP_NUM_THREADS=1 found live on the pod (`env | grep -i
+# THREADS`) is coming from outside both files entirely - almost certainly
+# a RunPod pod-level environment variable (template default or something
+# set when the pod was configured), not a build artifact. Rather than
+# depend on finding and removing that external setting, the wrapper now
+# defends against it directly at the point colmap actually runs.
+# (Separately, and NOT the fix for this: the ORIGINAL ~11,158s bottleneck
+# on this same pipeline turned out to be GPU VRAM exhaustion in COLMAP's
+# GPU sparse solver at full 8016-image scale, not CPU threading - solved
+# by moving that job to an 80GB A100. This OMP_NUM_THREADS fix is a
+# legitimate, separate correctness issue worth having regardless.)
 
 ########################################
 # Stage 1: builder
 ########################################
 ARG CUDA_VERSION=12.8.0
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS builder
-
 # Which LichtFeld-Studio git ref to build. Override at build time with
 # --build-arg LFS_REF=v0.5.2 (or a commit SHA) to pin an exact version
 # instead of always tracking master.
 ARG LFS_REF=master
 ENV DEBIAN_FRONTEND=noninteractive
-
 # GCC 14 installs directly via apt on Ubuntu 24.04+ (per the project's own
 # Linux build wiki - no PPA needed here, unlike older Ubuntu releases).
 # The X11/GL/GTK -dev packages are needed at BUILD/link time even for a
@@ -59,7 +77,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100 \
     && rm -rf /var/lib/apt/lists/*
-
 # Modern CMake from Kitware directly - mirrors what LichtFeld's own
 # docker/Dockerfile does (it explicitly pulls CMake 4.0.3 rather than
 # trusting Ubuntu 24.04's packaged 3.28, which is a signal their
@@ -70,17 +87,14 @@ RUN wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc \
         > /etc/apt/sources.list.d/kitware.list \
     && apt-get update && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
-
 ENV VCPKG_ROOT=/opt/vcpkg
 RUN git clone https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
     && ${VCPKG_ROOT}/bootstrap-vcpkg.sh -disableMetrics
 ENV PATH="${VCPKG_ROOT}:${PATH}"
-
 WORKDIR /opt/src
 RUN git clone --recursive https://github.com/MrNeRF/LichtFeld-Studio.git . \
     && git checkout ${LFS_REF} \
     && git submodule update --init --recursive
-
 # LichtFeld's own build hardcodes -march=native for Release builds
 # (src/core/CMakeLists.txt, confirmed by reading it directly) - no CMake
 # option exposes it, so it has to be patched here. -march=native bakes in
@@ -93,7 +107,6 @@ RUN git clone --recursive https://github.com/MrNeRF/LichtFeld-Studio.git . \
 # supports, and consistent with the -mavx2 -mfma the project already opts
 # into explicitly a few lines below the -march=native line in that same file.
 RUN sed -i 's/-march=native/-march=x86-64-v3/' src/core/CMakeLists.txt
-
 # Build flags:
 #   BUILD_CUDA_PTX_ONLY + BUILD_PORTABLE: JIT PTX at first run instead of
 #     baking one fixed SM target, so this one image works whatever GPU
@@ -140,7 +153,6 @@ RUN --mount=type=cache,target=/vcpkg-binary-cache \
     && cmake --build build -- -j$(nproc) \
     && cmake --install build --prefix /opt/lichtfeld \
     && rm -rf ${VCPKG_ROOT}/buildtrees ${VCPKG_ROOT}/downloads build
-
 # Discover the actual runtime .so closure via ldd instead of guessing which
 # apt runtime packages the binary needs - copies every non-system shared
 # library the built binary links against into a vendor-libs dir that ships
@@ -160,7 +172,6 @@ RUN BIN="$(find /opt/lichtfeld/bin -maxdepth 1 -type f -executable | head -n1)" 
 # binary, its vocab tree, and its runtime .so closure, without copying this
 # whole ~660MB image into a layer.
 FROM dakord/oblaq-colmap-base:latest AS colmap-base
-
 # `chroot` below only gets colmap-base's filesystem, not its Docker image
 # config (ENV/PATH/etc. are metadata, not files) - if colmap-base, like
 # nvidia/cuda base images generally, exposes some of its CUDA/math
@@ -184,9 +195,7 @@ RUN echo "$LD_LIBRARY_PATH" > /captured_ld_library_path.txt
 ########################################
 ARG CUDA_VERSION=12.8.0
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04 AS runtime
-
 ENV DEBIAN_FRONTEND=noninteractive
-
 # openssh-server: NOT included by default, and RunPod only auto-configures
 # SSH for its own stock templates - a custom image needs this added
 # explicitly (see the header comment / oblaQ's prior COLMAP-base image,
@@ -245,11 +254,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir --break-system-packages gdown
-
 COPY --from=builder /opt/lichtfeld /opt/lichtfeld
 ENV LD_LIBRARY_PATH="/opt/lichtfeld/lib:/opt/lichtfeld/vendor-libs:${LD_LIBRARY_PATH}"
 ENV PATH="/opt/lichtfeld/bin:/opt/lichtfeld/vendor-libs:${PATH}"
-
 # COLMAP: reused from oblaQ's already-built, already-proven CUDA-enabled
 # COLMAP 4.1.1 image (dakord/oblaq-colmap-base) instead of compiling it from
 # source here - a from-source COLMAP build needs Ceres, Qt6, CGAL, boost,
@@ -394,10 +401,24 @@ RUN --mount=type=bind,from=colmap-base,target=/colmap-base,rw \
 # already on the default PATH for every login mechanism (nothing extra to
 # set), and LD_LIBRARY_PATH is scoped to just this one exec instead of the
 # whole shell environment.
-RUN printf '#!/bin/sh\nexec env LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" /opt/colmap/bin/colmap "$@"\n' \
+#
+# 2026-08-30: also normalizes OMP_NUM_THREADS here, for the same "scope it
+# to just this one exec, not the whole shell" reason as LD_LIBRARY_PATH
+# above. Neither this Dockerfile nor start.sh sets OMP_NUM_THREADS anywhere
+# - the "=1" found live on a real pod (`env | grep -i THREADS`) traces to
+# something outside both files, most likely a RunPod pod-level environment
+# variable (template default or a setting made when the pod was
+# configured) - so this can't be fixed by removing a line here. Instead:
+# if OMP_NUM_THREADS is unset OR exactly "1" (the suspicious default),
+# bump it to the pod's real core count via nproc; if it's deliberately set
+# to something else (e.g. 8, to leave headroom for other processes on a
+# shared pod), leave it alone. Confirmed live on a 16-core pod that COLMAP's
+# global_mapper single-threads its Ceres/BLAS-heavy stages under
+# OMP_NUM_THREADS=1 - this is what --GlobalMapper.num_threads 16 was
+# worked around with manually before this fix existed.
+RUN printf '#!/bin/sh\n[ "${OMP_NUM_THREADS:-1}" = "1" ] && export OMP_NUM_THREADS="$(nproc)"\nexec env LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" /opt/colmap/bin/colmap "$@"\n' \
         > /usr/local/bin/colmap \
     && chmod +x /usr/local/bin/colmap
-
 # Second, complementary check to the one in the vendoring step above: that
 # one verifies colmap-base's OWN chroot can resolve every dependency (is
 # colmap-base itself broken); this one verifies the ASSEMBLED
@@ -424,10 +445,8 @@ RUN if LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/col
     fi \
     && colmap -h >/dev/null \
     && echo "OK: colmap -h runs via the /usr/local/bin wrapper"
-
 COPY lichtfeld-headless /usr/local/bin/lichtfeld-headless
 RUN chmod +x /usr/local/bin/lichtfeld-headless
-
 # Live training monitor: LichtFeld's CLI has an undocumented (not in the
 # wiki, confirmed only by reading argument_parser.cpp) TCP signals/events
 # feature - `--tcp-connection --tcp-server-port <p> --tcp-broadcast-port
@@ -445,7 +464,6 @@ ARG LFS_TCP_BROADCAST_PORT=8091
 ENV LFS_TCP_SERVER_PORT=${LFS_TCP_SERVER_PORT}
 ENV LFS_TCP_BROADCAST_PORT=${LFS_TCP_BROADCAST_PORT}
 EXPOSE ${LFS_TCP_SERVER_PORT} ${LFS_TCP_BROADCAST_PORT}
-
 # --- SSH setup (build-time config; runtime key injection happens in start.sh) ---
 # X11Forwarding: pinned explicitly rather than trusting this base image's
 # default - needed to view a GUI app (colmap gui, or the LichtFeld GUI
@@ -466,9 +484,7 @@ RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh \
     && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
     && sed -i 's/X11Forwarding no/X11Forwarding yes/' /etc/ssh/sshd_config \
     && (grep -q '^X11Forwarding yes' /etc/ssh/sshd_config || echo 'X11Forwarding yes' >> /etc/ssh/sshd_config)
-
 COPY start.sh /root/start.sh
 RUN chmod +x /root/start.sh
-
 WORKDIR /root
 ENTRYPOINT ["/root/start.sh"]
