@@ -163,7 +163,14 @@ RUN --mount=type=cache,target=/vcpkg-binary-cache \
 # library the built binary links against into a vendor-libs dir that ships
 # in stage 2. (CUDA driver libs are NOT among these - RunPod's NVIDIA
 # container runtime mounts those into the container at pod start.)
-RUN BIN="$(find /opt/lichtfeld/bin -maxdepth 1 -type f -executable | head -n1)" \
+# v0.5.4 FIX (2026-10-13): bin/ now also holds run_lichtfeld.sh, uv, python3
+# etc., so the old `find -executable | head -n1` grabbed a non-binary ("not a
+# dynamic executable"), vendor-libs came out EMPTY and .entrypoint-bin pointed
+# at the wrong file. Name the real binary explicitly and fail loudly if ldd
+# can't read it, instead of silently shipping an empty vendor-libs again.
+RUN BIN=/opt/lichtfeld/bin/LichtFeld-Studio \
+    && test -x "$BIN" || (echo "ERROR: $BIN missing - installed bin/ contents:" >&2; ls -la /opt/lichtfeld/bin >&2; exit 1) \
+    && ldd "$BIN" >/dev/null || (echo "ERROR: ldd cannot read $BIN" >&2; exit 1) \
     && echo "$BIN" > /opt/lichtfeld/.entrypoint-bin \
     && mkdir -p /opt/lichtfeld/vendor-libs \
     && ldd "$BIN" | awk '{print $3}' | grep '^/' | sort -u \
@@ -442,8 +449,12 @@ RUN printf '#!/bin/sh\n[ "${OMP_NUM_THREADS:-1}" = "1" ] && export OMP_NUM_THREA
 # the vendoring-step check above - X && Y counts as failed whenever Y's
 # exit 1 runs, so the trailing `|| echo OK` fired unconditionally and this
 # check could never actually fail the build no matter what ldd reported.
+# 2026-10-13: now PRINTS the missing libraries - previously `grep -q`
+# swallowed them, so "see above" pointed at nothing.
 RUN if LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/colmap/bin/colmap | grep -qi "not found"; then \
-      echo "ERROR: colmap has unresolved shared library dependencies in the assembled destination image - see above" >&2; \
+      echo "ERROR: colmap has unresolved shared library dependencies in the assembled destination image:" >&2; \
+      LD_LIBRARY_PATH="/opt/colmap/vendor-libs:${LD_LIBRARY_PATH}" ldd /opt/colmap/bin/colmap | grep -i "not found" >&2; \
+      echo "--- /opt/colmap/vendor-libs contents:" >&2; ls /opt/colmap/vendor-libs >&2; \
       exit 1; \
     else \
       echo "OK: colmap's dependency closure resolves cleanly in the destination image"; \
