@@ -27,7 +27,7 @@ set -euo pipefail
 
 BIN="$(cat /opt/lichtfeld/.entrypoint-bin 2>/dev/null || true)"
 if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
-    BIN="$(find /opt/lichtfeld/bin -maxdepth 1 -type f -executable | head -n1)"
+    BIN=/opt/lichtfeld/bin/LichtFeld-Studio
 fi
 
 ARGS=("$@")
