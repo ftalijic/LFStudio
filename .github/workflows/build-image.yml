@@ -27,7 +27,7 @@ jobs:
     # free instead of costing paid GPU-hours; layer caching below (cache-from
     # /cache-to: type=gha) means only the FIRST build pays this in full -
     # later rebuilds (e.g. bumping lfs_ref) reuse unchanged layers.
-    timeout-minutes: 240
+    timeout-minutes: 360  # GitHub-hosted hard ceiling; v0.5.4 changes vcpkg.json a lot, so expect a long uncached rebuild
     steps:
       - uses: actions/checkout@v4
 
