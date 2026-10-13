@@ -9,7 +9,7 @@ on:
       lfs_ref:
         description: "LichtFeld-Studio git ref to build (branch, tag, or commit SHA)"
         required: false
-        default: "master"
+        default: "v0.5.4"
   push:
     branches: [main, master]
     paths:
@@ -58,7 +58,7 @@ jobs:
           push: true
           pull: true
           build-args: |
-            LFS_REF=${{ github.event.inputs.lfs_ref || 'master' }}
+            LFS_REF=${{ github.event.inputs.lfs_ref || 'v0.5.4' }}
           tags: |
             dakord/lichtfeld-studio:latest
             dakord/lichtfeld-studio:${{ github.run_number }}
