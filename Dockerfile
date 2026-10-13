@@ -252,11 +252,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # this only in the builder stage would satisfy cmake --install's dependency
 # check but silently ship a pod that's missing cuDNN at actual train time -
 # it has to be installed here too, in the image that's actually deployed.
+# libblas3 liblapack3 (2026-10-13): colmap's vendored liblapack.so.3 needs
+# libblas.so.3, which the chroot vendoring step never captured (it ended up
+# "not found" in the destination check). Installing Ubuntu's own reference
+# BLAS here provides it - same soname, no vendoring trickery needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server \
         libglu1-mesa libgl1 libegl1 libgtk-3-0 \
         libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 \
-        libgomp1 libgfortran5 \
+        libgomp1 libgfortran5 libblas3 liblapack3 \
         libcudnn9-cuda-12 \
         libglew2.2 \
         xvfb xauth \
