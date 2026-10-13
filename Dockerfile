@@ -45,7 +45,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS builder
 # Which LichtFeld-Studio git ref to build. Override at build time with
 # --build-arg LFS_REF=v0.5.2 (or a commit SHA) to pin an exact version
 # instead of always tracking master.
-ARG LFS_REF=master
+ARG LFS_REF=v0.5.4
 ENV DEBIAN_FRONTEND=noninteractive
 # GCC 14 installs directly via apt on Ubuntu 24.04+ (per the project's own
 # Linux build wiki - no PPA needed here, unlike older Ubuntu releases).
@@ -81,11 +81,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # docker/Dockerfile does (it explicitly pulls CMake 4.0.3 rather than
 # trusting Ubuntu 24.04's packaged 3.28, which is a signal their
 # CMakeLists.txt needs newer than that).
+# PINNED to 4.4.0 (2026-10-13, for LFS v0.5.4): upstream's own Ubuntu CI pins
+# exactly this version because CMake 4.4.1 regressed check_symbol_exists
+# (stops honouring CMAKE_REQUIRED_FLAGS, silently breaks feature detection -
+# kitware work_item 28001). Unpinned, this line would pull 4.4.1+.
 RUN wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc \
         | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ noble main" \
         > /etc/apt/sources.list.d/kitware.list \
-    && apt-get update && apt-get install -y --no-install-recommends cmake \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        cmake=4.4.0-0kitware1ubuntu24.04.1 cmake-data=4.4.0-0kitware1ubuntu24.04.1 \
     && rm -rf /var/lib/apt/lists/*
 ENV VCPKG_ROOT=/opt/vcpkg
 RUN git clone https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
